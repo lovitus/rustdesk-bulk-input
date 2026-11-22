@@ -21,5 +21,8 @@ void main() {
       expect(o.text.codeUnitAt(o.text.length - 1) & 0xFC00, isNot(0xD800));
     }
   });
+  test('maxChunk < 2 rejected', () {
+    expect(() => planBulkInput('😀', maxChunk: 1), throwsRangeError);
+  });
   test('empty input', () => expect(planBulkInput(''), isEmpty));
 }

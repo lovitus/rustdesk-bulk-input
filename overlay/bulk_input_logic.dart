@@ -21,6 +21,9 @@ class BulkOp {
 /// Split [input] into text chunks and explicit newline ops. Text never
 /// contains '\n', so the remote never turns it into a bare Enter.
 List<BulkOp> planBulkInput(String input, {int maxChunk = 200}) {
+  if (maxChunk < 2) {
+    throw RangeError.range(maxChunk, 2, null, 'maxChunk');
+  }
   final lines =
       input.replaceAll('\r\n', '\n').replaceAll('\r', '\n').split('\n');
   final ops = <BulkOp>[];

@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 
@@ -15,7 +14,12 @@ bool bulkInputActive = false;
 /// channel (KeyEvent.seq) and never touches the system clipboard.
 class BulkInputButton extends StatefulWidget {
   final FFI ffi;
-  const BulkInputButton({Key? key, required this.ffi}) : super(key: key);
+  final VoidCallback onAcquireKeyboard;
+  const BulkInputButton({
+    Key? key,
+    required this.ffi,
+    required this.onAcquireKeyboard,
+  }) : super(key: key);
   @override
   State<BulkInputButton> createState() => _BulkInputButtonState();
 }
@@ -24,6 +28,7 @@ class _BulkInputButtonState extends State<BulkInputButton> {
   Offset? _pos;
   static String _draft = '';
   static BulkNewlineMode _mode = BulkNewlineMode.shiftEnter;
+  static bool _sending = false;
 
   @override
   Widget build(BuildContext context) {
@@ -49,50 +54,82 @@ class _BulkInputButtonState extends State<BulkInputButton> {
     );
   }
 
-  Future<void> _send(String text) async {
-    final sid = widget.ffi.sessionId;
-    for (final op in planBulkInput(text)) {
-      if (!op.newline) {
-        await bind.sessionInputString(sessionId: sid, value: op.text);
-        await Future.delayed(const Duration(milliseconds: 15));
-        continue;
+  bool _allowed(FFI ffi) =>
+      ffi.ffiModel.keyboard &&
+      !ffi.inputModel.isViewOnly &&
+      ffi.inputModel.keyboardInputAllowed;
+
+  Future<void> _send(FFI ffi, ModalRoute<dynamic>? owner, String text) async {
+    if (_sending || !_allowed(ffi) || owner?.isActive == false) return;
+    _sending = true;
+    final mode = _mode; // fixed for the whole transmission
+    final sid = ffi.sessionId;
+    try {
+      for (final op in planBulkInput(text)) {
+        if (!_allowed(ffi) || owner?.isActive == false) return;
+        if (!op.newline) {
+          await bind.sessionInputString(sessionId: sid, value: op.text);
+          await Future.delayed(const Duration(milliseconds: 15));
+          continue;
+        }
+        if (mode == BulkNewlineMode.space) {
+          await bind.sessionInputString(sessionId: sid, value: ' ');
+        } else {
+          await bind.sessionInputKey(
+              sessionId: sid,
+              name: 'VK_RETURN',
+              down: false,
+              press: true,
+              alt: false,
+              ctrl: false,
+              shift: mode == BulkNewlineMode.shiftEnter,
+              command: false);
+        }
+        await Future.delayed(const Duration(milliseconds: 25));
       }
-      if (_mode == BulkNewlineMode.space) {
-        await bind.sessionInputString(sessionId: sid, value: ' ');
-      } else {
-        await bind.sessionInputKey(
-            sessionId: sid,
-            name: 'VK_RETURN',
-            down: false,
-            press: true,
-            alt: false,
-            ctrl: false,
-            shift: _mode == BulkNewlineMode.shiftEnter,
-            command: false);
-      }
-      await Future.delayed(const Duration(milliseconds: 25));
+    } finally {
+      _sending = false;
     }
   }
 
-  Future<void> _showKeyboard(FocusNode f) async {
-    // RustDesk disables the soft keyboard at the native layer when it is
-    // hidden from the remote page; re-enable it, then ask for it.
-    await widget.ffi.invokeMethod("enable_soft_keyboard", true);
-    f.requestFocus();
-    await SystemChannels.textInput.invokeMethod('TextInput.show');
-  }
-
-  void _open() {
+  Future<void> _open() async {
+    if (bulkInputActive) return;
+    final ffi = widget.ffi;
+    final owner = ModalRoute.of(context);
+    final navigator = Navigator.of(context, rootNavigator: true);
+    // View.of: the Scaffold body's MediaQuery has the keyboard inset removed.
+    final kbWasVisible = View.of(context).viewInsets.bottom > 0;
     final c = TextEditingController(text: _draft);
-    // keep the draft on every edit, so tapping outside never loses it
-    c.addListener(() => _draft = c.text);
+    void saveDraft() => _draft = c.text;
+    c.addListener(saveDraft);
     final focus = FocusNode();
-    bulkInputActive = true;
-    final kbWasVisible = MediaQuery.of(context).viewInsets.bottom > 0;
-    WidgetsBinding.instance.addPostFrameCallback((_) => _showKeyboard(focus));
-    showDialog(
+    var generation = 0;
+    String? error;
+    var initialShowScheduled = false;
+    late final DialogRoute<void> route;
+
+    Future<void> showKeyboard() async {
+      if (!route.isCurrent) return;
+      final request = ++generation;
+      await ffi.invokeMethod('enable_soft_keyboard', true);
+      if (request != generation || !route.isCurrent) return;
+      // EditableText opens/shows its own text-input connection (focus + IME).
+      final st = focus.context?.findAncestorStateOfType<EditableTextState>();
+      if (st != null) {
+        st.requestKeyboard();
+      } else {
+        focus.requestFocus();
+      }
+    }
+
+    route = DialogRoute<void>(
       context: context,
+      themes: InheritedTheme.capture(from: context, to: navigator.context),
       builder: (ctx) => StatefulBuilder(builder: (ctx, setS) {
+        if (!initialShowScheduled) {
+          initialShowScheduled = true;
+          WidgetsBinding.instance.addPostFrameCallback((_) => showKeyboard());
+        }
         return AlertDialog(
           title: const Text('Bulk input'),
           content: SingleChildScrollView(
@@ -105,35 +142,43 @@ class _BulkInputButtonState extends State<BulkInputButton> {
                 keyboardType: TextInputType.multiline,
                 decoration: const InputDecoration(border: OutlineInputBorder()),
               ),
+              if (error != null)
+                Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(error!, style: const TextStyle(color: Colors.red))),
               const SizedBox(height: 4),
               Row(children: [
                 IconButton(
                   icon: const Icon(Icons.keyboard),
                   tooltip: 'Show keyboard',
-                  onPressed: () => _showKeyboard(focus),
+                  onPressed: showKeyboard,
                 ),
                 IconButton(
                   icon: const Icon(Icons.keyboard_hide),
                   tooltip: 'Hide keyboard',
-                  onPressed: () => FocusScope.of(ctx).unfocus(),
+                  onPressed: () {
+                    ++generation; // cancel any pending show
+                    focus.unfocus();
+                  },
                 ),
                 const SizedBox(width: 8),
-                Expanded(child: DropdownButton<BulkNewlineMode>(
-                isExpanded: true,
-                value: _mode,
-                items: const [
-                  DropdownMenuItem(
-                      value: BulkNewlineMode.shiftEnter,
-                      child: Text('Newline = Shift+Enter (safe)')),
-                  DropdownMenuItem(
-                      value: BulkNewlineMode.enter,
-                      child: Text('Newline = Enter (may execute)')),
-                  DropdownMenuItem(
-                      value: BulkNewlineMode.space,
-                      child: Text('Newline = space')),
-                ],
-                onChanged: (v) => setS(() => _mode = v ?? _mode),
-              )),
+                Expanded(
+                    child: DropdownButton<BulkNewlineMode>(
+                  isExpanded: true,
+                  value: _mode,
+                  items: const [
+                    DropdownMenuItem(
+                        value: BulkNewlineMode.shiftEnter,
+                        child: Text('Newline = Shift+Enter (safe)')),
+                    DropdownMenuItem(
+                        value: BulkNewlineMode.enter,
+                        child: Text('Newline = Enter (may execute)')),
+                    DropdownMenuItem(
+                        value: BulkNewlineMode.space,
+                        child: Text('Newline = space')),
+                  ],
+                  onChanged: (v) => setS(() => _mode = v ?? _mode),
+                )),
               ]),
             ]),
           ),
@@ -143,24 +188,43 @@ class _BulkInputButtonState extends State<BulkInputButton> {
                 child: const Text('Close')),
             TextButton(onPressed: () => c.clear(), child: const Text('Clear')),
             ElevatedButton(
-                onPressed: () async {
+                onPressed: () {
+                  // reject BEFORE touching the draft, so nothing is lost
+                  if (_sending) {
+                    setS(() => error = 'Previous send still running');
+                    return;
+                  }
+                  if (!_allowed(ffi) || owner?.isActive == false) {
+                    setS(() => error = 'Keyboard input not allowed');
+                    return;
+                  }
                   final t = c.text;
+                  c.removeListener(saveDraft);
                   _draft = '';
                   Navigator.pop(ctx);
-                  await _send(t);
+                  _send(ffi, owner, t);
                 },
                 child: const Text('Send')),
           ],
         );
       }),
-    ).whenComplete(() {
-      bulkInputActive = false;
-      focus.unfocus();
-      if (!kbWasVisible) {
-        widget.ffi.invokeMethod("enable_soft_keyboard", false);
-      }
+    );
+
+    bulkInputActive = true;
+    try {
+      // cancel upstream timers that would re-take focus / hide the keyboard
+      widget.onAcquireKeyboard();
+      navigator.push<void>(route); // its future may never complete on forced removal
+      // controller/focus node are still used by the exit animation until now
+      await route.completed;
+    } finally {
+      ++generation;
       c.dispose();
       focus.dispose();
-    });
+      bulkInputActive = false;
+      if (!kbWasVisible && owner?.isActive == true) {
+        ffi.invokeMethod('enable_soft_keyboard', false);
+      }
+    }
   }
 }
