@@ -1,0 +1,284 @@
+name: Track upstream, patch, verify, release
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream ref/tag to build (empty = latest stable release)"
+        default: ""
+      force:
+        description: "Rebuild even if a release for this upstream+patch already exists"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths: [overlay/**, scripts/**, PATCH_REV, .github/workflows/build.yml]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      ref: ${{ steps.r.outputs.ref }}
+      sha: ${{ steps.r.outputs.sha }}
+      tag: ${{ steps.r.outputs.tag }}
+      version: ${{ steps.r.outputs.version }}
+      skip: ${{ steps.r.outputs.skip }}
+      rust: ${{ steps.v.outputs.rust }}
+      flutter: ${{ steps.v.outputs.flutter }}
+      bridge_flutter: ${{ steps.v.outputs.bridge_flutter }}
+      ndk: ${{ steps.v.outputs.ndk }}
+      cargo_ndk: ${{ steps.v.outputs.cargo_ndk }}
+      vcpkg: ${{ steps.v.outputs.vcpkg }}
+      frb: ${{ steps.v.outputs.frb }}
+      expand: ${{ steps.v.outputs.expand }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: patch }
+      - name: Resolve upstream ref
+        id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ref="${{ inputs.ref }}"
+          [ -n "$ref" ] || ref=$(gh api repos/rustdesk/rustdesk/releases/latest --jq .tag_name)
+          sha=$(gh api repos/rustdesk/rustdesk/commits/$ref --jq .sha)
+          rev=$(cat patch/PATCH_REV)
+          tag="rd-${ref}-bulk${rev}"
+          skip=false
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "${{ inputs.force }}" != "true" ]; then skip=true; fi
+          echo "ref=$ref sha=$sha tag=$tag skip=$skip"
+          { echo ref=$ref; echo sha=$sha; echo tag=$tag; echo skip=$skip; echo version=${ref#v}; } >> $GITHUB_OUTPUT
+      - name: Read toolchain versions from upstream workflows
+        id: v
+        if: steps.r.outputs.skip != 'true'
+        run: |
+          B=https://raw.githubusercontent.com/rustdesk/rustdesk/${{ steps.r.outputs.sha }}/.github/workflows
+          curl -fsSL $B/flutter-build.yml -o fb.yml
+          curl -fsSL $B/bridge.yml -o br.yml
+          g() { grep -m1 -E "^  $2:" $1 | sed -E 's/^[^"]*"([^"]*)".*/\1/'; }
+          rust=$(g fb.yml RUST_VERSION); flutter=$(g fb.yml ANDROID_FLUTTER_VERSION)
+          ndk=$(g fb.yml NDK_VERSION); cn=$(g fb.yml CARGO_NDK_VERSION); vc=$(g fb.yml VCPKG_COMMIT_ID)
+          frb=$(g br.yml FLUTTER_RUST_BRIDGE_VERSION); ex=$(g br.yml CARGO_EXPAND_VERSION)
+          bf=$(grep -m1 -E 'flutter-version: "' br.yml | sed -E 's/.*"([^"]+)".*/\1/')
+          for x in "$rust" "$flutter" "$ndk" "$cn" "$vc" "$frb" "$ex" "$bf"; do
+            [ -n "$x" ] || { echo "::error::failed to parse upstream toolchain versions"; exit 1; }
+          done
+          echo "rust=$rust flutter=$flutter bridge_flutter=$bf ndk=$ndk cargo_ndk=$cn frb=$frb"
+          { echo rust=$rust; echo flutter=$flutter; echo bridge_flutter=$bf; echo ndk=$ndk
+            echo cargo_ndk=$cn; echo vcpkg=$vc; echo frb=$frb; echo expand=$ex; } >> $GITHUB_OUTPUT
+
+  # Fast gate: patch applies cleanly + pure-Dart unit tests.
+  test:
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: patch }
+      - uses: actions/checkout@v4
+        with:
+          repository: rustdesk/rustdesk
+          ref: ${{ needs.prepare.outputs.sha }}
+          path: up
+      - name: Apply patch (fails on upstream anchor drift)
+        run: python3 patch/scripts/apply.py up && python3 patch/scripts/apply.py up
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ needs.prepare.outputs.flutter }}
+      - name: Unit tests
+        run: |
+          mkdir t && cd t && cp ../patch/overlay/bulk_input_logic*.dart . 
+          printf 'name: t\nenvironment:\n  sdk: ">=3.0.0 <4.0.0"\ndev_dependencies:\n  test: any\n' > pubspec.yaml
+          dart pub get && dart test
+
+  bridge:
+    needs: [prepare, test]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: rustdesk/rustdesk
+          ref: ${{ needs.prepare.outputs.sha }}
+          submodules: recursive
+      - run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang cmake curl gcc git g++ libclang-dev libgtk-3-dev llvm-dev nasm ninja-build pkg-config wget
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ needs.prepare.outputs.rust }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with: { prefix-key: bridge }
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ needs.prepare.outputs.bridge_flutter }}
+          cache: true
+      - name: Generate bridge
+        run: |
+          cargo install cargo-expand --version ${{ needs.prepare.outputs.expand }} --locked
+          cargo install flutter_rust_bridge_codegen --version ${{ needs.prepare.outputs.frb }} --features "uuid" --locked
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          (cd flutter && flutter pub get)
+          ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bridge
+          path: |
+            src/bridge_generated.rs
+            src/bridge_generated.io.rs
+            flutter/lib/generated_bridge.dart
+            flutter/lib/generated_bridge.freezed.dart
+
+  android:
+    needs: [prepare, bridge]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { arch: aarch64, target: aarch64-linux-android, abi: arm64-v8a, ndk_sh: ndk_arm64.sh, plat: android-arm64, apk: app-arm64-v8a-release.apk, libdir: aarch64-linux-android }
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: jlumbroso/free-disk-space@v1.3.1
+        with: { tool-cache: false, android: false, dotnet: true, haskell: true, large-packages: false, docker-images: true, swap-storage: false }
+      - name: Export GHA cache env
+        uses: actions/github-script@v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake curl gcc-multilib git g++ g++-multilib libasound2-dev libc6-dev libclang-dev libunwind-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgtk-3-dev libpulse-dev libva-dev libxcb-randr0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxdo-dev libxfixes-dev llvm-dev nasm ninja-build openjdk-17-jdk-headless pkg-config tree wget
+      - uses: actions/checkout@v4
+        with: { path: patch }
+      - uses: actions/checkout@v4
+        with:
+          repository: rustdesk/rustdesk
+          ref: ${{ needs.prepare.outputs.sha }}
+          submodules: recursive
+          path: up
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ needs.prepare.outputs.flutter }}
+      - name: Patch flutter (upstream dropdown fix)
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          if [ -f "$GITHUB_WORKSPACE/up/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff" ] && [ "${{ needs.prepare.outputs.flutter }}" = "3.24.5" ]; then
+            git apply "$GITHUB_WORKSPACE/up/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+          fi
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: ${{ needs.prepare.outputs.ndk }}
+          add-to-path: true
+      - uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ needs.prepare.outputs.vcpkg }}
+          doNotCache: false
+      - name: vcpkg deps
+        working-directory: up
+        run: ./flutter/build_android_deps.sh ${{ matrix.job.abi }}
+      - uses: actions/download-artifact@v4
+        with: { name: bridge, path: up }
+      - name: Apply bulk-input patch
+        run: python3 patch/scripts/apply.py up
+      - name: Customize app id so it coexists with official RustDesk
+        working-directory: up/flutter/android/app
+        run: |
+          sed -i 's/applicationId "com.carriez.flutter_hbb"/applicationId "com.carriez.flutter_hbb.bulk"/' build.gradle
+          grep -q 'flutter_hbb.bulk' build.gradle
+          sed -i '0,/android:label="RustDesk"/s//android:label="RustDesk Bulk"/' src/main/AndroidManifest.xml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ needs.prepare.outputs.rust }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: up
+          prefix-key: rd-bulk-android
+          key: ${{ matrix.job.target }}
+      - name: Build librustdesk
+        working-directory: up
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          rustup target add ${{ matrix.job.target }}
+          cargo install cargo-ndk --version ${{ needs.prepare.outputs.cargo_ndk }} --locked
+          ./flutter/${{ matrix.job.ndk_sh }}
+          J=flutter/android/app/src/main/jniLibs/${{ matrix.job.abi }}
+          mkdir -p $J
+          cp target/${{ matrix.job.target }}/release/liblibrustdesk.so $J/librustdesk.so
+          cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${{ matrix.job.libdir }}/libc++_shared.so $J/
+      - name: Static analysis of patched Dart (errors fail the build)
+        working-directory: up/flutter
+        run: |
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' pubspec.yaml || true
+          flutter pub get
+          flutter analyze --no-fatal-infos --no-fatal-warnings lib/mobile/widgets/bulk_input.dart lib/mobile/widgets/bulk_input_logic.dart lib/mobile/pages/remote_page.dart
+      - name: Build APK
+        working-directory: up
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+        run: |
+          export PATH=$JAVA_HOME/bin:$PATH
+          sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" flutter/android/gradle.properties
+          sed -i "s/signingConfigs.release/signingConfigs.debug/g" flutter/android/app/build.gradle
+          cd flutter
+          flutter build apk --release --target-platform ${{ matrix.job.plat }} --split-per-abi
+          mkdir -p ../../out
+          cp build/app/outputs/flutter-apk/${{ matrix.job.apk }} ../../out/unsigned.apk
+      - name: Sign
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          [ -n "$KS_B64" ] || { echo "::error::ANDROID_KEYSTORE_B64 secret missing"; exit 1; }
+          echo "$KS_B64" | base64 -d > ks.jks
+          BT=$(ls -d /usr/local/lib/android/sdk/build-tools/* | sort -V | tail -1)
+          OUT=out/rustdesk-bulk-${VERSION}-${{ matrix.job.arch }}.apk
+          $BT/zipalign -f -p 4 out/unsigned.apk out/aligned.apk
+          $BT/apksigner sign --ks ks.jks --ks-key-alias rdbulk --ks-pass env:KS_PASS --out $OUT out/aligned.apk
+          rm -f ks.jks out/unsigned.apk out/aligned.apk
+          echo "APK=$OUT" >> $GITHUB_ENV
+      - name: Verify APK
+        run: |
+          BT=$(ls -d /usr/local/lib/android/sdk/build-tools/* | sort -V | tail -1)
+          $BT/apksigner verify --verbose "$APK" | head -5
+          unzip -l "$APK" | grep -q "lib/${{ matrix.job.abi }}/librustdesk.so"
+          $BT/aapt dump badging "$APK" | grep -E "package: name='com.carriez.flutter_hbb.bulk'"
+          # the new Dart code must be compiled into the AOT snapshot
+          unzip -p "$APK" lib/${{ matrix.job.abi }}/libapp.so | grep -aq "BulkInputButton"
+          sha256sum "$APK" | tee "$APK.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ matrix.job.arch }}
+          path: out/*
+
+  release:
+    needs: [prepare, android]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { pattern: apk-*, merge-multiple: true, path: out }
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          T=${{ needs.prepare.outputs.tag }}
+          gh release delete "$T" -R "$GITHUB_REPOSITORY" --cleanup-tag -y 2>/dev/null || true
+          gh release create "$T" out/* -R "$GITHUB_REPOSITORY" \
+            --title "RustDesk ${{ needs.prepare.outputs.ref }} + bulk input" \
+            --notes "Upstream rustdesk/rustdesk @ ${{ needs.prepare.outputs.sha }} + bulk-input patch rev $(date +%F). Package id com.carriez.flutter_hbb.bulk (coexists with official app). Signed with this project's key."
