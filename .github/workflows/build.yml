@@ -225,7 +225,6 @@ jobs:
       - name: Static analysis of patched Dart (errors fail the build)
         working-directory: up/flutter
         run: |
-          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' pubspec.yaml || true
           flutter pub get
           flutter analyze --no-fatal-infos --no-fatal-warnings lib/mobile/widgets/bulk_input.dart lib/mobile/widgets/bulk_input_logic.dart lib/mobile/pages/remote_page.dart
       - name: Build APK
