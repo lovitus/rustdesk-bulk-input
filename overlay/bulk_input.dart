@@ -5,6 +5,12 @@ import 'package:flutter_hbb/models/platform_model.dart';
 
 import 'bulk_input_logic.dart';
 
+/// True while the bulk dialog is open. RustDesk's remote page watches the
+/// soft keyboard and, on every change, steals focus back to its hidden input
+/// field / disables the native keyboard; that races with our TextField and
+/// made the keyboard collapse right after showing. The page checks this flag.
+bool bulkInputActive = false;
+
 /// Floating button + multiline dialog. Text goes through the remote key-event
 /// channel (KeyEvent.seq) and never touches the system clipboard.
 class BulkInputButton extends StatefulWidget {
@@ -81,6 +87,7 @@ class _BulkInputButtonState extends State<BulkInputButton> {
     // keep the draft on every edit, so tapping outside never loses it
     c.addListener(() => _draft = c.text);
     final focus = FocusNode();
+    bulkInputActive = true;
     final kbWasVisible = MediaQuery.of(context).viewInsets.bottom > 0;
     WidgetsBinding.instance.addPostFrameCallback((_) => _showKeyboard(focus));
     showDialog(
@@ -147,6 +154,7 @@ class _BulkInputButtonState extends State<BulkInputButton> {
         );
       }),
     ).whenComplete(() {
+      bulkInputActive = false;
       focus.unfocus();
       if (!kbWasVisible) {
         widget.ffi.invokeMethod("enable_soft_keyboard", false);

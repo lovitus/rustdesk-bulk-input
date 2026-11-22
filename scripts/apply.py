@@ -34,5 +34,10 @@ ind = m.group(1)
 ins = (f"{ind}if (gFFI.ffiModel.keyboard) {{\n"
        f"{ind}  paints.add(BulkInputButton(ffi: gFFI));\n{ind}}}\n")
 s = s[:m.start()] + ins + s[m.start():]
+a = 'void onSoftKeyboardChanged(bool visible) {\n'
+if a not in s:
+    sys.exit('ANCHOR DRIFT: onSoftKeyboardChanged')
+s = s.replace(a, a + '    // bulk-input patch: do not fight the bulk dialog over focus/keyboard\n'
+              '    if (bulkInputActive) {\n      setState(() {});\n      return;\n    }\n', 1)
 p.write_text(s)
 print('patched')
