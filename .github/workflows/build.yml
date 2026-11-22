@@ -96,7 +96,7 @@ jobs:
           flutter-version: ${{ needs.prepare.outputs.flutter }}
       - name: Unit tests
         run: |
-          mkdir t && cd t && cp ../patch/overlay/bulk_input_logic*.dart . 
+          mkdir -p t/lib t/test && cd t && cp ../patch/overlay/bulk_input_logic.dart lib/ && cp ../patch/overlay/bulk_input_logic_test.dart test/ && sed -i "s#import 'bulk_input_logic.dart'#import 'package:t/bulk_input_logic.dart'#" test/bulk_input_logic_test.dart
           printf 'name: t\nenvironment:\n  sdk: ">=3.0.0 <4.0.0"\ndev_dependencies:\n  test: any\n' > pubspec.yaml
           dart pub get && dart test
 
