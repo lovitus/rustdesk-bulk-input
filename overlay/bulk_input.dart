@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_hbb/models/model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 
@@ -67,8 +68,21 @@ class _BulkInputButtonState extends State<BulkInputButton> {
     }
   }
 
+  Future<void> _showKeyboard(FocusNode f) async {
+    // RustDesk disables the soft keyboard at the native layer when it is
+    // hidden from the remote page; re-enable it, then ask for it.
+    await widget.ffi.invokeMethod("enable_soft_keyboard", true);
+    f.requestFocus();
+    await SystemChannels.textInput.invokeMethod('TextInput.show');
+  }
+
   void _open() {
     final c = TextEditingController(text: _draft);
+    // keep the draft on every edit, so tapping outside never loses it
+    c.addListener(() => _draft = c.text);
+    final focus = FocusNode();
+    final kbWasVisible = MediaQuery.of(context).viewInsets.bottom > 0;
+    WidgetsBinding.instance.addPostFrameCallback((_) => _showKeyboard(focus));
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(builder: (ctx, setS) {
@@ -78,14 +92,26 @@ class _BulkInputButtonState extends State<BulkInputButton> {
             child: Column(mainAxisSize: MainAxisSize.min, children: [
               TextField(
                 controller: c,
-                autofocus: true,
+                focusNode: focus,
                 minLines: 6,
                 maxLines: 12,
                 keyboardType: TextInputType.multiline,
                 decoration: const InputDecoration(border: OutlineInputBorder()),
               ),
-              const SizedBox(height: 8),
-              DropdownButton<BulkNewlineMode>(
+              const SizedBox(height: 4),
+              Row(children: [
+                IconButton(
+                  icon: const Icon(Icons.keyboard),
+                  tooltip: 'Show keyboard',
+                  onPressed: () => _showKeyboard(focus),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.keyboard_hide),
+                  tooltip: 'Hide keyboard',
+                  onPressed: () => FocusScope.of(ctx).unfocus(),
+                ),
+                const SizedBox(width: 8),
+                Expanded(child: DropdownButton<BulkNewlineMode>(
                 isExpanded: true,
                 value: _mode,
                 items: const [
@@ -100,15 +126,13 @@ class _BulkInputButtonState extends State<BulkInputButton> {
                       child: Text('Newline = space')),
                 ],
                 onChanged: (v) => setS(() => _mode = v ?? _mode),
-              ),
+              )),
+              ]),
             ]),
           ),
           actions: [
             TextButton(
-                onPressed: () {
-                  _draft = c.text;
-                  Navigator.pop(ctx);
-                },
+                onPressed: () => Navigator.pop(ctx),
                 child: const Text('Close')),
             TextButton(onPressed: () => c.clear(), child: const Text('Clear')),
             ElevatedButton(
@@ -122,6 +146,13 @@ class _BulkInputButtonState extends State<BulkInputButton> {
           ],
         );
       }),
-    );
+    ).whenComplete(() {
+      focus.unfocus();
+      if (!kbWasVisible) {
+        widget.ffi.invokeMethod("enable_soft_keyboard", false);
+      }
+      c.dispose();
+      focus.dispose();
+    });
   }
 }
